@@ -1,0 +1,201 @@
+import pandas as pd
+import numpy as np
+import os
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime
+from google.colab import drive
+drive.mount('/content/drive')
+
+class WeatherPredictor:
+    def __init__(self, sequence_length=24):
+        self.sequence_length = sequence_length
+        self.scaler = StandardScaler()
+        self.model = None
+
+    def preprocess_data(self, kaggle_data, tensorflow_data):
+        # Process Kaggle data
+        kaggle_df = pd.DataFrame(kaggle_data)
+
+        # Convert timestamps to UTC and handle mixed timezones
+        try:
+            kaggle_df['Formatted Date'] = pd.to_datetime(kaggle_df['Formatted Date'], utc=True)
+        except Exception as e:
+            print(f"Error in datetime conversion: {e}")
+            return None
+
+        # Correct column mapping based on actual data
+        feature_columns = {
+            'Temperature (C)': 'Temperature',
+            'Humidity': 'Humidity',
+            'Wind Speed (km/h)': 'Wind Speed (km/h)',
+            'Pressure (millibars)': 'Pressure (millibars)',
+            'Wind Bearing (degrees)': 'Wind Bearing (degrees)',
+            'Visibility (km)': 'Visibility (km)'
+        }
+
+        # Create a new dataframe with renamed columns
+        modeling_data = kaggle_df[list(feature_columns.keys())].copy()
+        modeling_data.rename(columns=feature_columns, inplace=True)
+
+        # Add temporal features
+        modeling_data['Hour'] = kaggle_df['Formatted Date'].dt.hour
+        modeling_data['Month'] = kaggle_df['Formatted Date'].dt.month
+
+        # Create cyclical encoding
+        modeling_data['Hour_sin'] = np.sin(2 * np.pi * modeling_data['Hour']/24)
+        modeling_data['Hour_cos'] = np.cos(2 * np.pi * modeling_data['Hour']/24)
+        modeling_data['Month_sin'] = np.sin(2 * np.pi * modeling_data['Month']/12)
+        modeling_data['Month_cos'] = np.cos(2 * np.pi * modeling_data['Month']/12)
+
+        # Handle any missing values
+        modeling_data = modeling_data.fillna(method='ffill').fillna(method='bfill')
+
+        # Normalize numerical features
+        numerical_features = list(feature_columns.values())
+        self.scaler = StandardScaler()
+        modeling_data[numerical_features] = self.scaler.fit_transform(modeling_data[numerical_features])
+
+        return modeling_data
+
+    def create_sequences(self, data, target_col='Temperature'):
+        X, y = [], []
+        data_len = len(data)
+
+        for i in range(data_len - self.sequence_length):
+            # Select all features for the sequence
+            sequence = data.iloc[i:(i + self.sequence_length)]
+            X.append(sequence.values)
+            y.append(data[target_col].iloc[i + self.sequence_length])
+
+        return np.array(X), np.array(y)
+
+    def build_model(self, input_shape):
+        self.model = Sequential([
+            LSTM(64, return_sequences=True, input_shape=input_shape),
+            Dropout(0.2),
+            LSTM(32, return_sequences=False),
+            Dropout(0.2),
+            Dense(16, activation='relu'),
+            Dense(1)
+        ])
+
+        self.model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+        return self.model
+
+    def train_model(self, X_train, y_train, X_val, y_val, epochs=50, batch_size=32):
+        history = self.model.fit(
+            X_train, y_train,
+            validation_data=(X_val, y_val),
+            epochs=epochs,
+            batch_size=batch_size,
+            callbacks=[
+                tf.keras.callbacks.EarlyStopping(
+                    monitor='val_loss',
+                    patience=5,
+                    restore_best_weights=True
+                )
+            ]
+        )
+        return history
+
+    def evaluate_model(self, X_test, y_test):
+        predictions = self.model.predict(X_test)
+
+        # Calculate metrics
+        mae = mean_absolute_error(y_test, predictions)
+        rmse = np.sqrt(mean_squared_error(y_test, predictions))
+        r2 = r2_score(y_test, predictions)
+
+        return {
+            'MAE': mae,
+            'RMSE': rmse,
+            'R2': r2
+        }
+
+    def plot_results(self, history, predictions, y_test):
+        # Plot training history
+        plt.figure(figsize=(12, 4))
+        plt.subplot(1, 2, 1)
+        plt.plot(history.history['loss'], label='Training Loss')
+        plt.plot(history.history['val_loss'], label='Validation Loss')
+        plt.title('Model Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+
+        # Plot predictions vs actual
+        plt.subplot(1, 2, 2)
+        plt.scatter(y_test, predictions, alpha=0.5)
+        plt.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--', lw=2)
+        plt.xlabel('Actual Temperature')
+        plt.ylabel('Predicted Temperature')
+        plt.title('Predictions vs Actual')
+        plt.tight_layout()
+        plt.show()
+
+def main():
+    # Initialize predictor
+    predictor = WeatherPredictor(sequence_length=24)
+
+    try:
+        # Load Kaggle data
+        kaggle_data = pd.read_csv('/content/drive/MyDrive/weatherHistory.csv')
+        print("Loaded Kaggle data shape:", kaggle_data.shape)
+        print("\nSample of Formatted Date column:", kaggle_data['Formatted Date'].head())
+
+        # Load TensorFlow data
+        zip_path = tf.keras.utils.get_file(
+            origin='https://storage.googleapis.com/tensorflow/tf-keras-datasets/jena_climate_2009_2016.csv.zip',
+            fname='jena_climate_2009_2016.csv.zip',
+            extract=True)
+        csv_path, _ = os.path.splitext(zip_path)
+        tensorflow_data = pd.read_csv(csv_path)
+        print("\nLoaded TensorFlow data shape:", tensorflow_data.shape)
+
+        # Preprocess data
+        processed_data = predictor.preprocess_data(kaggle_data, tensorflow_data)
+        if processed_data is None:
+            raise ValueError("Data preprocessing failed")
+
+        print("\nProcessed data shape:", processed_data.shape)
+        print("\nProcessed columns:", processed_data.columns.tolist())
+
+        # Create sequences
+        X, y = predictor.create_sequences(processed_data)
+        print("\nSequence shapes:", X.shape, y.shape)
+
+        # Split data
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        X_train, X_val, y_train, y_val = train_test_split(X_train, y_train, test_size=0.2, random_state=42)
+
+        # Build and train model
+        model = predictor.build_model(input_shape=(X_train.shape[1], X_train.shape[2]))
+        history = predictor.train_model(X_train, y_train, X_val, y_val)
+
+        # Evaluate model
+        metrics = predictor.evaluate_model(X_test, y_test)
+        print("\nModel Evaluation Metrics:")
+        print(f"MAE: {metrics['MAE']:.4f}")
+        print(f"RMSE: {metrics['RMSE']:.4f}")
+        print(f"R2 Score: {metrics['R2']:.4f}")
+
+        # Plot results
+        predictions = predictor.model.predict(X_test)
+        predictor.plot_results(history, predictions, y_test)
+
+    except Exception as e:
+        print(f"\nAn error occurred: {str(e)}")
+        print("\nDataframe info:")
+        print(kaggle_data.info())
+        print("\nColumn names:")
+        print(kaggle_data.columns.tolist())
+
+if __name__ == "__main__":
+    main()
